@@ -73,6 +73,14 @@ type Crawler struct {
 	start     time.Time
 	results   []models.Page
 	resultsMu sync.Mutex
+	// performance snapshots: elapsed seconds -> pages crawled
+	snapshots   []statPoint
+	snapshotsMu sync.Mutex
+}
+
+type statPoint struct {
+	Elapsed float64
+	Pages   int64
 }
 
 func New(cfg Config, store *storage.MongoStore) *Crawler {
@@ -124,6 +132,25 @@ func (c *Crawler) Run() {
 		c.wg.Add(1)
 		go c.worker(ctx)
 	}
+
+	// Performance tracker – record pages every 5 seconds
+	go func() {
+		t := time.NewTicker(5 * time.Second)
+		defer t.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-t.C:
+				c.snapshotsMu.Lock()
+				c.snapshots = append(c.snapshots, statPoint{
+					Elapsed: time.Since(c.start).Seconds(),
+					Pages:   atomic.LoadInt64(&c.pages),
+				})
+				c.snapshotsMu.Unlock()
+			}
+		}
+	}()
 
 	ticker := time.NewTicker(300 * time.Millisecond)
 	defer ticker.Stop()
@@ -243,17 +270,41 @@ func (c *Crawler) crawl(ctx context.Context, j job) {
 
 func (c *Crawler) printSummary() {
 	elapsed := time.Since(c.start).Round(time.Millisecond)
+	pages := atomic.LoadInt64(&c.pages)
 	fmt.Println("\n==================== CRAWL SUMMARY ====================")
-	fmt.Printf("Pages crawled     : %d\n", atomic.LoadInt64(&c.pages))
+	fmt.Printf("Pages crawled     : %d\n", pages)
 	fmt.Printf("Errors            : %d\n", atomic.LoadInt64(&c.errors))
 	fmt.Printf("Blocked (robots)  : %d\n", atomic.LoadInt64(&c.blocked))
 	fmt.Printf("Duration          : %s\n", elapsed)
-	if atomic.LoadInt64(&c.pages) > 0 {
-		fmt.Printf("Avg time per page : %s\n", (elapsed / time.Duration(atomic.LoadInt64(&c.pages))).Round(time.Millisecond))
+	if pages > 0 {
+		fmt.Printf("Avg time per page : %s\n", (elapsed / time.Duration(pages)).Round(time.Millisecond))
+		fmt.Printf("Crawl speed       : %.2f pages/sec\n", float64(pages)/elapsed.Seconds())
 	}
 	if c.store != nil && c.store.Enabled() {
 		if n, err := c.store.Count(); err == nil {
 			fmt.Printf("Stored in MongoDB : %d\n", n)
+		}
+	}
+
+	// Performance over time
+	c.snapshotsMu.Lock()
+	snaps := append([]statPoint{}, c.snapshots...)
+	c.snapshotsMu.Unlock()
+	if len(snaps) > 0 {
+		fmt.Println("\nPerformance over time:")
+		fmt.Println("  Elapsed(s) | Pages | Speed (pages/s)")
+		var prevPages int64
+		var prevElapsed float64
+		for _, s := range snaps {
+			deltaP := s.Pages - prevPages
+			deltaT := s.Elapsed - prevElapsed
+			speed := 0.0
+			if deltaT > 0 {
+				speed = float64(deltaP) / deltaT
+			}
+			fmt.Printf("  %9.1f | %5d | %.2f\n", s.Elapsed, s.Pages, speed)
+			prevPages = s.Pages
+			prevElapsed = s.Elapsed
 		}
 	}
 	fmt.Println("=======================================================")
